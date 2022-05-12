@@ -42,6 +42,12 @@ Following flags are not supported on Broadwell:
 	      Two ranges allowed (shared with -S)
 --stop-range -S start,end  Stop trace when reaching virtual address start-end. Can be kernel
 	      symbols. Two ranges allowed (shared with -F)
+
+Feature flags supported only on some CPUs:
+--disable-branch	 Disable branch tracing
+--ptwrite		 Enable output of data from PTWRITE instructions.
+--fup-on-ptw		 Always log instruction pointer of PTWRITE (useful with --disable-branch)
+--power			 Enable power event tracing
 EOU
 	exit 1
 }
@@ -50,7 +56,8 @@ PATH=$PATH:$(dirname $0)
 
 unset COMM KERNEL TRACE USERMODE DISRETC DRIVER DONTDUMP PREFIX ENUMALL
 unset CYC_THRESH MTC_FREQ PSB_FREQ FILTER TSTOP START STOP FORCE KEEP
-unset PRINT_REGS ENABLE_ONLY DUMP_ONLY DISABLE
+unset PRINT_REGS ENABLE_ONLY DUMP_ONLY DISABLE DISABLE_BRANCH PTWRITE FUP_ON_PTW
+unset PWR_EVT
 declare -a RANGE_START RANGE_END RANGE_CFG
 NUM_RANGE=0
 MAX_RANGE=2
@@ -58,6 +65,28 @@ ENUMDFL=1
 
 declare -a ARGS
 ARGS=($@)
+
+resolvesym()
+{
+	echo >&2 $1
+	case "$1" in
+	[0-9]*)	echo -n $1 ;;
+	*)
+		# do arithmetic in bc because kernel addresses don't fit into awk double
+		awk -v sym=$1 '
+		BEGIN {
+			offset = 0
+			if (split(sym,a,"+") == 2) {
+				offset = strtonum(a[2])
+				sym = a[1]
+			}
+		}
+		$3 == sym {
+			printf "ibase=16 ; " toupper($1) " + %X\n", offset
+		}' /proc/kallsyms | bc
+		;;
+	esac
+}
 
 B=0
 for ((j = 0; j < $#; j++)) ; do
@@ -88,6 +117,10 @@ for ((j = 0; j < $#; j++)) ; do
 	--enable) ARGS[$j]=-E ;;
 	--dump) ARGS[$j]=-D ;;
 	--disable) ARGS[$j]="-@" ; DISABLE=1 ;;
+	--ptwrite) ARGS[$j]="-@"; PTWRITE=1 ;;
+	--fup-on-ptw) ARGS[$j]="-@"; FUP_ON_PTW=1 ;;
+	--disable-branch) ARGS[$j]="-@"; DISABLE_BRANCH=1 ;;
+	--power) ARGS[$j]="-@"; PWR_EVT=1 ;;
 	--) ARGS[$j]=${ARGS[$j]}; B=1 ;;
 	--*) usage ; exit 1 ;;
 	*) ARGS[$j]="${ARGS[$j]}" ;;
@@ -119,14 +152,16 @@ while getopts "c:KtURkfdNo:eC:M:P:F:S:s:y:@ED" opt ${ARGS[@]} ; do
 	   ptfeature psb_freq $PSB_FREQ || usage
 	   ;;
 	F) IFS=, read st end <<< "$OPTARG"
-	   RANGE_START[$NUM_RANGE]=$st
-	   RANGE_END[$NUM_RANGE]=$end
+	   RANGE_START[$NUM_RANGE]=`resolvesym $st`
+	   RANGE_END[$NUM_RANGE]=`resolvesym $end`
+	   echo ${RANGE_START[$NUM_RANGE]}
+	   echo ${RANGE_END[$NUM_RANGE]}
 	   RANGE_CFG[$NUM_RANGE]=1
 	   (( NUM_RANGE++ ))
 	   ;;
 	S) IFS=, read st end <<< "$OPTARG"
-	   RANGE_START[$NUM_RANGE]=$st
-	   RANGE_END[$NUM_RANGE]=$end
+	   RANGE_START[$NUM_RANGE]=`resolvesym $st`
+	   RANGE_END[$NUM_RANGE]=`resolvesym $end`
 	   RANGE_CFG[$NUM_RANGE]=2
 	   (( NUM_RANGE++ ))
 	   ;;
@@ -161,6 +196,10 @@ STOP=${STOP:-0}
 FORCE=${FORCE:-0}
 KEEP=${KEEP:-}
 PRINT_REGS=${PRINT_REGS:-0}
+DISABLE_BRANCH=${DISABLE_BRANCH:-0}
+PTWRITE=${PTWRITE:-0}
+FUP_ON_PTW=${FUP_ON_PTW:-0}
+PWR_EVT=${PWR_EVT:-0}
 
 if [ "$EUID" -ne 0 ] ; then
 	echo >&2 sptcmd needs to run as root
@@ -169,10 +208,12 @@ fi
 
 [ -n "$DRIVER" ] && /sbin/rmmod simple_pt
 if ! lsmod | grep -q simple_pt ; then
+	TL=$(grep -qw tasklist_lock /proc/kallsyms &&
+		awk '$3 == "tasklist_lock" { print "tasklist_lock_ptr=0x" $1 } ' /proc/kallsyms )
 	if [ -r simple-pt.ko ] ; then
-		/sbin/insmod simple-pt.ko force=$FORCE
+		/sbin/insmod simple-pt.ko force=$FORCE $TL
 	else
-		/sbin/modprobe simple-pt force=$FORCE
+		/sbin/modprobe simple-pt force=$FORCE $TL
 	fi
 fi
 C=/sys/module/simple_pt/parameters
@@ -219,6 +260,10 @@ if [ -z "$DUMP_ONLY" ] ; then
 	echo $MTC_FREQ > $C/mtc_freq
 	echo $CYC_THRESH > $C/cyc_thresh
 	echo $PSB_FREQ > $C/psb_freq
+	echo $DISABLE_BRANCH > $C/disable_branch
+	echo $PTWRITE > $C/ptw
+	echo $FUP_ON_PTW > $C/fup_on_ptw
+	echo $PWR_EVT > $C/pwr_evt
 	for (( r = 0; r < NUM_RANGE; r++ )) ; do
 		echo ${RANGE_START[$r]} > $C/addr${r}_start
 		echo ${RANGE_END[$r]} > $C/addr${r}_end

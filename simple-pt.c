@@ -51,6 +51,7 @@
 #include <linux/gfp.h>
 #include <linux/io.h>
 #include <linux/mm.h>
+#include <linux/nodemask.h>
 #include <linux/uaccess.h>
 #include <linux/sched.h>
 #include <linux/kallsyms.h>
@@ -61,6 +62,7 @@
 #include <trace/events/sched.h>
 #include <asm/msr.h>
 #include <asm/processor.h>
+#include <asm/processor-flags.h>
 #define CREATE_TRACE_POINTS
 #include "pttp.h"
 
@@ -76,10 +78,13 @@
 #define CTL_USER	BIT_ULL(3)
 #define PT_ERROR	BIT_ULL(4)
 #define CR3_FILTER	BIT_ULL(7)
+#define PWR_EVT_EN	BIT_ULL(4)
+#define FUP_ON_PTW_EN	BIT_ULL(5)
 #define TO_PA		BIT_ULL(8)
 #define MTC_EN		BIT_ULL(9)
 #define TSC_EN		BIT_ULL(10)
 #define DIS_RETC	BIT_ULL(11)
+#define PTW_EN		BIT_ULL(12)
 #define BRANCH_EN	BIT_ULL(13)
 #define MTC_MASK	(0xf << 14)
 #define CYC_MASK	(0xf << 19)
@@ -149,32 +154,7 @@ static int symbol_set(const char *val, const struct kernel_param *kp)
 {
 	int ret = -EIO;
 	if (!isdigit(val[0])) {
-		char sym[128];
-		unsigned offset = 0;
-		unsigned long addr;
-		char *plus, *nl;
-
-		snprintf(sym, 128, "%s", val);
-		nl = strchr(sym, '\n');
-		if (nl)
-			*nl = 0;
-		plus = strchr(sym, '+');
-		if (plus) {
-			*plus = 0;
-			if (kstrtouint(plus + 1, 0, &offset) < 0) {
-				pr_err("Invalid offset\n");
-				return -EIO;
-			}
-		}
-		addr = kallsyms_lookup_name(sym);
-		if (!addr)
-			pr_err("Lookup of '%s' symbol failed\n", sym);
-		if (addr && offset)
-			addr += offset;
-		if (addr) {
-			*(unsigned long *)(kp->arg) = addr;
-			ret = 0;
-		}
+		pr_err("Symbols are not supported anymore. Please resolve through /proc/kallsyms");
 	} else {
 		ret = param_set_ulong(val, kp);
 	}
@@ -220,9 +200,28 @@ static struct kprobe stop_kprobe = {
 static int kprobe_set(const char *val, const struct kernel_param *kp,
 		      struct kprobe *kprobe)
 {
-	int ret = symbol_set(val, kp);
-	unsigned long addr = *(unsigned long *)(kp->arg);
+	int ret;
+	unsigned long addr;
+	char sym[128];
 
+	if (!isdigit(val[0])) {
+		int syml = strcspn(val, "+");
+		if (syml >= sizeof(sym) - 1) {
+			pr_err("Symbol too large %s\n", sym);
+			return -EIO;
+		}
+		memcpy(sym, val, syml);
+		sym[syml] = 0;
+		kprobe->symbol_name = sym;
+		if (val[syml] == '+')
+			syml++;
+		if (kstrtouint(val + syml, 0, &kprobe->offset) < 0) {
+			pr_err("Invalid offset in %s\n", val);
+			return -EIO;
+		}
+	}
+	ret = symbol_set(val, kp);
+	addr = *(unsigned long *)(kp->arg);
 	mutex_lock(&kprobe_mutex);
 	if (kprobe->addr) {
 		unregister_kprobe(kprobe);
@@ -298,6 +297,8 @@ static DEFINE_PER_CPU(bool, pt_running);
 static DEFINE_PER_CPU(u64, pt_offset);
 static bool initialized;
 static bool has_cr3_match;
+static bool has_ptw;
+static bool has_pwr_evt;
 static unsigned psb_freq_mask;
 static unsigned cyc_thresh_mask;
 static unsigned mtc_freq_mask;
@@ -331,12 +332,25 @@ MODULE_PARM_DESC(cr3_filter, "Enable CR3 filter");
 static int dis_retc = 0;
 module_param_cb(dis_retc, &resync_ops, &dis_retc, 0644);
 MODULE_PARM_DESC(dis_retc, "Disable return compression");
+static int ptw = 0;
+module_param_cb(ptw, &resync_ops, &ptw, 0644);
+MODULE_PARM_DESC(ptw, "Enable PTWRITE (if supported)");
+static int fup_on_ptw = 0;
+module_param_cb(fup_on_ptw, &resync_ops, &fup_on_ptw, 0644);
+MODULE_PARM_DESC(fup_on_ptw, "Report IP on each PTWRITE (with ptw=1)");
+static int pwr_evt = 0;
+module_param_cb(pwr_evt, &resync_ops, &pwr_evt, 0644);
+MODULE_PARM_DESC(pwr_evt, "Enable power tracing (if supported)");
 static bool clear_on_start = true;
 module_param(clear_on_start, bool, 0644);
 MODULE_PARM_DESC(clear_on_start, "Clear PT buffer before start");
 static bool single_range = false;
 module_param(single_range, bool, 0444);
 MODULE_PARM_DESC(single_range, "Use single range output");
+static int num_sro_bases;
+static unsigned long sro_bases[1<<NODES_SHIFT];
+module_param_array(sro_bases, ulong, &num_sro_bases, 0444);
+MODULE_PARM_DESC(sro_bases, "physical addresses of SRO buffers");
 static int enumerate_all = 0;
 module_param_cb(enumerate_all, &enumerate_ops, &enumerate_all, 0644);
 MODULE_PARM_DESC(enumerate_all, "Enumerate all processes CR3s (only use after initialization)");
@@ -386,6 +400,8 @@ module_param_cb(log_dump, &log_dump_ops, &log_dump, 0644);
 
 static DEFINE_MUTEX(restart_mutex);
 
+static atomic_long_t sro_bases_curr[1<<NODES_SHIFT];
+
 static inline int pt_wrmsrl_safe(unsigned msr, u64 val)
 {
 	int ret = wrmsrl_safe(msr, val);
@@ -407,6 +423,44 @@ static void init_mask_ptrs(void)
 			((1ULL << (PAGE_SHIFT + pt_buffer_order)) - 1));
 	else
 		pt_wrmsrl_safe(MSR_IA32_RTIT_OUTPUT_MASK_PTRS, 0ULL);
+}
+
+// https://carteryagemann.com/pid-to-cr3.html
+static u64 pid_to_cr3(int const pid)
+{
+	unsigned long cr3_phys = 0;
+	rcu_read_lock();
+	{
+		struct pid *pidp = find_vpid(pid);
+		struct task_struct * task;
+		struct mm_struct *mm;
+
+		if (!pidp)
+			goto out;
+		task = pid_task(pidp, PIDTYPE_PID);
+		if (task == NULL)
+			goto out; // pid has no task_struct
+		mm = task->mm;
+
+		// mm can be NULL in some rare cases (e.g. kthreads)
+		// when this happens, we should check active_mm
+		if (mm == NULL) {
+			mm = task->active_mm;
+			if (mm == NULL)
+				goto out; // this shouldn't happen, but just in case
+		}
+
+		cr3_phys = virt_to_phys((void*)mm->pgd);
+	}
+out:
+	rcu_read_unlock();
+	return cr3_phys;
+}
+
+static inline void set_cr3_filter0(u64 cr3)
+{
+	if(pt_wrmsrl_safe(MSR_IA32_CR3_MATCH, cr3) < 0)
+		pr_err("cpu %d, cannot set CR3 filter\n", smp_processor_id());
 }
 
 static int start_pt(void)
@@ -444,8 +498,23 @@ static int start_pt(void)
 	if (user)
 		val |= CTL_USER;
 	if (cr3_filter && has_cr3_match) {
-		if (!(oldval & CR3_FILTER))
-			pt_wrmsrl_safe(MSR_IA32_CR3_MATCH, 0ULL);
+		if(cr3_filter > 1) {
+			u64 cr3 = pid_to_cr3(cr3_filter) & ~CR3_PCID_MASK;
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+			if (IS_ENABLED(CONFIG_PAGE_TABLE_ISOLATION) && static_cpu_has(X86_FEATURE_PTI)) {
+				if(user) {
+					cr3 |= 1 << PAGE_SHIFT;
+					if(kernel) {
+						pr_warn("Cannot trace kernel along with user space using CR3 filter in PTI-enabled kernel.\n");
+					}
+				}
+			}
+#endif
+			set_cr3_filter0(cr3);
+			comm_filter[0] = '\0';	// Do not re-target on exec()
+		} else if(!(oldval & CR3_FILTER)) {
+			set_cr3_filter0(0ULL);
+		}
 		val |= CR3_FILTER;
 	}
 	if (dis_retc)
@@ -456,6 +525,13 @@ static int start_pt(void)
 		val |= ((mtc_freq - 1) << 14) | MTC_EN;
 	if (psb_freq && ((1U << (psb_freq-1)) & psb_freq_mask))
 		val |= (psb_freq - 1) << 24;
+	if (ptw && has_ptw) {
+		val |= PTW_EN;
+		if (fup_on_ptw)
+			val |= FUP_ON_PTW_EN;
+	}
+	if (pwr_evt && has_pwr_evt)
+		val |= PWR_EVT_EN;
 	if (addr0_cfg && (addr0_cfg <= addr_cfg_max) && addr_range_num >= 1) {
 		val |= ((u64)addr0_cfg << ADDR0_SHIFT);
 		pt_wrmsrl_safe(MSR_IA32_ADDR0_START, addr0_start);
@@ -551,13 +627,9 @@ static int probe_stop(struct kprobe *kp, struct pt_regs *regs)
 static void do_enumerate_all(void)
 {
 	struct task_struct *t;
-	/* XXX, better way? */
 	rwlock_t *my_tasklist_lock = (rwlock_t *)tasklist_lock_ptr;
-	if (!my_tasklist_lock)
-		my_tasklist_lock = (rwlock_t *)kallsyms_lookup_name("tasklist_lock");
 	if (!my_tasklist_lock) {
-		pr_err("Cannot find tasklist_lock. CONFIG_KALLSYMS_ALL disabled?\n");
-		pr_err("Specify tasklist_lock_ptr parameter at module load\n");
+		pr_err("Specify tasklist_lock_ptr parameter at load to support enumeration of running processes\n");
 		return;
 	}
 
@@ -590,15 +662,23 @@ static int simple_pt_buffer_init(int cpu)
 {
 	unsigned long pt_buffer;
 	u64 *topa;
+	int node;
 
 	/* allocate buffer */
 	pt_buffer = per_cpu(pt_buffer_cpu, cpu);
 	if (!pt_buffer) {
-		pt_buffer = __get_free_pages(GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO, pt_buffer_order);
-		if (!pt_buffer) {
-			pr_err("cpu %d, Cannot allocate %ld KB buffer\n", cpu,
-					(PAGE_SIZE << pt_buffer_order) / 1024);
-			return -ENOMEM;
+		if (num_sro_bases) {
+			node = cpu_to_node(cpu);
+			pt_buffer = (long)__va(atomic_long_add_return(
+					1UL << pt_buffer_order,
+					&sro_bases_curr[node]) << PAGE_SHIFT);
+		} else {
+			pt_buffer = __get_free_pages(GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO, pt_buffer_order);
+			if (!pt_buffer) {
+				pr_err("cpu %d, Cannot allocate %ld KB buffer\n", cpu,
+						(PAGE_SIZE << pt_buffer_order) / 1024);
+				return -ENOMEM;
+			}
 		}
 		per_cpu(pt_buffer_cpu, cpu) = pt_buffer;
 	}
@@ -779,8 +859,7 @@ static void set_cr3_filter(void *arg)
 		return;
 	if ((val & TRACE_EN) && pt_wrmsrl_safe(MSR_IA32_RTIT_CTL, val & ~TRACE_EN) < 0)
 		return;
-	if (pt_wrmsrl_safe(MSR_IA32_CR3_MATCH, *(u64 *)arg) < 0)
-		pr_err("cpu %d, cannot set cr3 filter\n", smp_processor_id());
+	set_cr3_filter0(*(u64*)arg);
 	if ((val & TRACE_EN) && pt_wrmsrl_safe(MSR_IA32_RTIT_CTL, val) < 0)
 		return;
 }
@@ -800,29 +879,29 @@ static bool match_comm(void)
 static u64 retrieve_cr3(void)
 {
 	u64 cr3;
+
 	asm volatile("mov %%cr3,%0" : "=r" (cr3));
-	return cr3;
+	return cr3 & ~0xfff; // mask out the PCID
 }
 
-static void probe_sched_process_exec(void *arg,
-				     struct task_struct *p, pid_t old_pid,
-				     struct linux_binprm *bprm)
+static int probe_exec(struct kprobe *kp, struct pt_regs *regs)
 {
-	u64 cr3 = retrieve_cr3();
+	u64 cr3;
 	char *pathbuf, *path;
 
 	if (!match_comm())
-		return;
+		return 0;
 
-	pathbuf = (char *)__get_free_page(GFP_ATOMIC);
+	pathbuf = (char *)__get_free_page(GFP_KERNEL);
 	if (!pathbuf)
-		return;
+		return 0;
 
 	/* mmap_sem needed? */
 	path = d_path(&current->mm->exe_file->f_path, pathbuf, PAGE_SIZE);
 	if (IS_ERR(path))
 		goto out;
 
+	cr3 = retrieve_cr3();
 	trace_exec_cr3(cr3, path, current->pid);
 	if (comm_filter[0] && has_cr3_match) {
 		mutex_lock(&restart_mutex);
@@ -831,6 +910,7 @@ static void probe_sched_process_exec(void *arg,
 	}
 out:
 	free_page((unsigned long)pathbuf);
+	return 0;
 }
 
 static int probe_mmap_region(struct kprobe *kp, struct pt_regs *regs)
@@ -875,6 +955,12 @@ out:
 static struct kprobe mmap_kp = {
 	.symbol_name = "mmap_region",
 	.pre_handler = probe_mmap_region,
+};
+
+/* Arbitrary symbol in the exec*() path that is called after the new mm/CR3 is set up */
+static struct kprobe finalize_exec_kp = {
+	.symbol_name = "finalize_exec",
+	.pre_handler = probe_exec,
 };
 
 static bool is_psb(void *p)
@@ -1017,6 +1103,8 @@ static int simple_pt_cpuid(void)
 		return -EIO;
 	}
 	has_cr3_match = !!(b & BIT(0));
+	has_ptw = !!(b & BIT(4));
+	has_pwr_evt = !!(b & BIT(5));
 	if (b & BIT(2))
 		addr_cfg_max = 2;
 	if (!(c & BIT(1)))
@@ -1037,7 +1125,6 @@ static int simple_pt_cpuid(void)
 
 static int spt_hotplug_state = -1;
 
-
 static void free_topa(u64 *topa)
 {
 	int j;
@@ -1053,7 +1140,6 @@ static void free_topa(u64 *topa)
 static int spt_cpu_startup(unsigned int cpu)
 {
 	int err;
-	printk("startup %u\n", cpu);
 	err = simple_pt_buffer_init(cpu);
 	if (err)
 		return err;
@@ -1062,7 +1148,6 @@ static int spt_cpu_startup(unsigned int cpu)
 
 static int spt_cpu_teardown(unsigned int cpu)
 {
-	printk("teardown %u\n", cpu);
 	stop_pt(NULL);
 	if (per_cpu(topa_cpu, cpu)) {
 		u64 *topa = per_cpu(topa_cpu, cpu);
@@ -1070,7 +1155,12 @@ static int spt_cpu_teardown(unsigned int cpu)
 		free_page((unsigned long)topa);
 		per_cpu(topa_cpu, cpu) = NULL;
 	}
-	if (per_cpu(pt_buffer_cpu, cpu)) {
+	if (per_cpu(pt_buffer_cpu, cpu) && !num_sro_bases) {
+		/*
+		 * With SRO Bases specified, keep existing pt_buffer_cpu,
+		 * as it's considered constant for the life time of
+		 * the module, not the life time of the CPU.
+		 */
 		free_pages(per_cpu(pt_buffer_cpu, cpu), pt_buffer_order);
 		per_cpu(pt_buffer_cpu, cpu) = 0;
 	}
@@ -1079,7 +1169,7 @@ static int spt_cpu_teardown(unsigned int cpu)
 
 static int simple_pt_init(void)
 {
-	int err;
+	int err, i;
 
 	if (THIS_MODULE->taints)
 		fix_tracepoints();
@@ -1094,6 +1184,25 @@ static int simple_pt_init(void)
 		return err;
 	}
 
+	if (!single_range)
+		num_sro_bases = 0;
+	else if (num_sro_bases) {
+		if (num_sro_bases != num_possible_nodes()) {
+			pr_err("sro_bases should be provided for %u nodes",
+					num_possible_nodes());
+			err = -EINVAL;
+			goto out_buffers;
+		}
+		for (i = 0; i != num_sro_bases; ++i) {
+			if (sro_bases[i] & ((1UL << pt_buffer_order) - 1)) {
+				pr_err("sro_bases must be aligned to 2^pt_buffer_order");
+				err = -EINVAL;
+				goto out_buffers;
+			}
+			atomic_long_set(&sro_bases_curr[i],
+					sro_bases[i] - (1UL << pt_buffer_order));
+		}
+	}
 	err = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "simple-pt",
 				       spt_cpu_startup,
 				       spt_cpu_teardown);
@@ -1102,9 +1211,14 @@ static int simple_pt_init(void)
 	spt_hotplug_state = err;
 
 	/* Trace exec->cr3 */
-	err = compat_register_trace_sched_process_exec(probe_sched_process_exec, NULL);
-	if (err)
-		pr_info("Cannot register exec tracepoint: %d\n", err);
+	/* This used to use the sched_exec trace point, but Linux doesn't
+	 * export trace points anymore.
+	 */
+	err = register_kprobe(&finalize_exec_kp);
+	if (err) {
+		pr_info("Cannot register exec kprobe on finalize_exec: %d\n", err);
+		/* Ignore error */
+	}
 
 	/* Trace mmap */
 	err = register_kprobe(&mmap_kp);
@@ -1140,7 +1254,7 @@ static void simple_pt_exit(void)
 	if (spt_hotplug_state >= 0)
 		cpuhp_remove_state(spt_hotplug_state);
 	misc_deregister(&simple_pt_miscdev);
-	compat_unregister_trace_sched_process_exec(probe_sched_process_exec, NULL);
+	unregister_kprobe(&finalize_exec_kp);
 	unregister_kprobe(&mmap_kp);
 	atomic_notifier_chain_unregister(&panic_notifier_list, &panic_notifier);
 	unregister_syscore_ops(&simple_pt_syscore);

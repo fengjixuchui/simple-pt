@@ -81,7 +81,7 @@ Also udis86 has been replaced with xed.__
 
 Build and install libipt
 
-	git clone https://github.com/01org/processor-trace
+	git clone https://github.com/01org/processor-trace -b stable/v2.0
 	cd processor-trace
 	cmake .
 	make
@@ -284,6 +284,13 @@ However the synchronization is not fine grained enough to directly determine cau
 * Decoder loses synchronization in some cases where it shouldn't.
 
 * Binaries with spaces in the name are not supported (due to limitations in sptsideband.py)
+
+* On 5.7+ kernels using symbol names located in modules in --start/stop-addr will leak the module count
+  of the module.
+
+* On systems with page table isolation active the -C filter can only filter on user code or kernel code,
+  but not both at the same time. To avoid this boot with pti=off. Note this may make the system
+  suspectible to Meltdown.
 
 # Porting simple-pt
 
